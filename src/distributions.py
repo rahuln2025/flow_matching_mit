@@ -1,0 +1,309 @@
+from abc import ABC, abstractmethod
+from typing import Optional, List, Type, Tuple, Dict
+import math
+
+import numpy as np
+from matplotlib import pyplot as plt
+import matplotlib.cm as cm
+from matplotlib.axes._axes import Axes
+import torch
+import torch.distributions as D
+from torch.func import vmap, jacrev
+from tqdm import tqdm
+import seaborn as sns
+from sklearn.datasets import make_moons, make_circles
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# template for sample-able distribution
+class Sampleable(ABC):
+    """
+    Distribution which can be sampled from
+    """
+    @property
+    @abstractmethod
+    def dim(self) -> int:
+        """
+        Returns:
+            - Dimensionality of the distribution
+        """
+        pass
+        
+    @abstractmethod
+    def sample(self, num_samples: int) -> torch.Tensor:
+        """
+        Args:
+            - num_samples: the desired number of samples
+        Returns:
+            - samples: shape (batch_size, dim)
+        """
+        pass
+
+# template for density of the distribution
+class Density(ABC):
+    """
+    Distribution with tractable density
+    """
+    @abstractmethod
+    def log_density(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Returns the log density at x.
+        Args:
+            - x: shape (batch_size, dim)
+        Returns:
+            - log_density: shape (batch_size, 1)
+        """
+        pass
+
+
+# Gaussian Distribution
+class Gaussian(torch.nn.Module, Sampleable, Density):
+    """
+    Multivariate Gaussian distribution
+    """
+    def __init__(self, mean: torch.Tensor, cov: torch.Tensor):
+        """
+        mean: shape (dim,)
+        cov: shape (dim,dim)
+        """
+        super().__init__()
+        self.register_buffer("mean", mean)
+        self.register_buffer("cov", cov)
+
+    @property
+    def dim(self) -> int:
+        return self.mean.shape[0]
+
+    @property
+    def distribution(self):
+        return D.MultivariateNormal(self.mean, self.cov, validate_args=False)
+
+    def sample(self, num_samples) -> torch.Tensor:
+        return self.distribution.sample((num_samples,))
+        
+    def log_density(self, x: torch.Tensor):
+        return self.distribution.log_prob(x).view(-1, 1)
+
+    @classmethod
+    def isotropic(cls, dim: int, std: float) -> "Gaussian":
+        mean = torch.zeros(dim)
+        cov = torch.eye(dim) * std ** 2
+        return cls(mean, cov)
+    
+
+# Gaussian Mixture Distribution(s)
+class GaussianMixture(torch.nn.Module, Sampleable, Density):
+    """
+    Two-dimensional Gaussian mixture model, and is a Density and a Sampleable. Wrapper around torch.distributions.MixtureSameFamily.
+    """
+    def __init__(
+        self,
+        means: torch.Tensor,  # nmodes x data_dim
+        covs: torch.Tensor,  # nmodes x data_dim x data_dim
+        weights: torch.Tensor,  # nmodes
+    ):
+        """
+        means: shape (nmodes, 2)
+        covs: shape (nmodes, 2, 2)
+        weights: shape (nmodes, 1)
+        """
+        super().__init__()
+        self.nmodes = means.shape[0]
+        self.register_buffer("means", means)
+        self.register_buffer("covs", covs)
+        self.register_buffer("weights", weights)
+
+    @property
+    def dim(self) -> int:
+        return self.means.shape[1]
+
+    @property
+    def distribution(self):
+        return D.MixtureSameFamily(
+                mixture_distribution=D.Categorical(probs=self.weights, validate_args=False),
+                component_distribution=D.MultivariateNormal(
+                    loc=self.means,
+                    covariance_matrix=self.covs,
+                    validate_args=False,
+                ),
+                validate_args=False,
+            )
+
+    def log_density(self, x: torch.Tensor) -> torch.Tensor:
+        return self.distribution.log_prob(x).view(-1, 1)
+
+    def sample(self, num_samples: int) -> torch.Tensor:
+        return self.distribution.sample(torch.Size((num_samples,)))
+
+    @classmethod
+    def random_2D(
+        cls, nmodes: int, std: float, scale: float = 10.0, x_offset: float = 0.0, seed = 0.0
+    ) -> "GaussianMixture":
+        torch.manual_seed(seed)
+        means = (torch.rand(nmodes, 2) - 0.5) * scale + x_offset * torch.Tensor([1.0, 0.0])
+        covs = torch.diag_embed(torch.ones(nmodes, 2)) * std ** 2
+        weights = torch.ones(nmodes)
+        return cls(means, covs, weights)
+
+    @classmethod
+    def symmetric_2D(
+        cls, nmodes: int, std: float, scale: float = 10.0, x_offset: float = 0.0
+    ) -> "GaussianMixture":
+        angles = torch.linspace(0, 2 * np.pi, nmodes + 1)[:nmodes]
+        means = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1) * scale + torch.Tensor([1.0, 0.0]) * x_offset
+        covs = torch.diag_embed(torch.ones(nmodes, 2) * std ** 2)
+        weights = torch.ones(nmodes) / nmodes
+        return cls(means, covs, weights)
+    
+
+# Some complex distributions
+# Moons
+class MoonsSampleable(Sampleable):
+    """
+    Implementation of the Moons distribution using sklearn's make_moons
+    """
+    def __init__(self, device: torch.device, noise: float = 0.05, scale: float = 5.0, offset: Optional[torch.Tensor] = None):
+        """
+        Args:
+            noise: Standard deviation of Gaussian noise added to the data
+            scale: How much to scale the data
+            offset: How much to shift the samples from the original distribution (2,)
+        """
+        self.noise = noise
+        self.scale = scale
+        self.device = device
+        if offset is None:
+            offset = torch.zeros(2)
+        self.offset = offset.to(device)
+
+    @property
+    def dim(self) -> int:
+        return 2
+
+    def sample(self, num_samples: int) -> torch.Tensor:
+        """
+        Args:
+            num_samples: Number of samples to generate
+        Returns:
+            torch.Tensor: Generated samples with shape (num_samples, 3)
+        """
+        samples, _ = make_moons(
+            n_samples=num_samples,
+            noise=self.noise,
+            random_state=None  # Allow for random generation each time
+        )
+        return self.scale * torch.from_numpy(samples.astype(np.float32)).to(self.device) + self.offset
+    
+class CirclesSampleable(Sampleable):
+    """
+    Implementation of concentric circle distribution using sklearn's make_circles
+    """
+    def __init__(self, device: torch.device, noise: float = 0.05, scale=5.0, offset: Optional[torch.Tensor] = None):
+        """
+        Args:
+            noise: standard deviation of Gaussian noise added to the data
+        """
+        self.noise = noise
+        self.scale = scale
+        self.device = device
+        if offset is None:
+            offset = torch.zeros(2)
+        self.offset = offset.to(device)
+
+    @property
+    def dim(self) -> int:
+        return 2
+
+    def sample(self, num_samples: int) -> torch.Tensor:
+        """
+        Args:
+            num_samples: number of samples to generate
+        Returns:
+            torch.Tensor: shape (num_samples, 3)
+        """
+        samples, _ = make_circles(
+            n_samples=num_samples,
+            noise=self.noise,
+            factor=0.5,
+            random_state=None
+        )
+        return self.scale * torch.from_numpy(samples.astype(np.float32)).to(self.device) + self.offset
+    
+class CheckerboardSampleable(Sampleable):
+    """
+    Checkboard-esque distribution
+    """
+    def __init__(self, device: torch.device, grid_size: int = 3, scale=5.0):
+        """
+        Args:
+            noise: standard deviation of Gaussian noise added to the data
+        """
+        self.grid_size = grid_size
+        self.scale = scale
+        self.device = device
+
+    @property
+    def dim(self) -> int:
+        return 2
+
+    def sample(self, num_samples: int) -> torch.Tensor:
+        """
+        Args:
+            num_samples: number of samples to generate
+        Returns:
+            torch.Tensor: shape (num_samples, 3)
+        """
+        grid_length = 2 * self.scale / self.grid_size
+        samples = torch.zeros(0,2).to(device)
+        while samples.shape[0] < num_samples:
+            # Sample num_samples
+            new_samples = (torch.rand(num_samples,2).to(self.device) - 0.5) * 2 * self.scale
+            x_mask = torch.floor((new_samples[:,0] + self.scale) / grid_length) % 2 == 0 # (bs,)
+            y_mask = torch.floor((new_samples[:,1] + self.scale) / grid_length) % 2 == 0 # (bs,)
+            accept_mask = torch.logical_xor(~x_mask, y_mask)
+            samples = torch.cat([samples, new_samples[accept_mask]], dim=0)
+        return samples[:num_samples]
+    
+
+
+class ImageSampleable(Sampleable):
+    """
+    TUBAF Logo distribution
+    """
+    def __init__(self, device: torch.device, points_file: str, points_array: np.array = None, scale=5.0):
+        super().__init__()
+        self.filepath = points_file
+        self.points_array = points_array
+        self.device = device
+        self.scale = scale
+
+    @property
+    def dim(self) -> int:
+        return 2
+    
+    def sample(self, num_samples: int) -> torch.Tensor:
+        """"
+        Args:
+            num_samples: number of samples to generate
+        Return:
+            torch.Tensor: shape (num_samples, 2)
+        """
+        if self.points_array is not None:
+            points = self.points_array
+        elif self.filepath is not None: 
+            points = np.loadtxt(self.filepath)
+
+        samples = torch.from_numpy(points.astype(np.float32)).to(self.device) * self.scale
+        self.n_points = points.shape[0]
+        
+        if num_samples <= self.n_points:
+            ixs = torch.randint(self.n_points, (num_samples,))
+            samples_needed = samples[ixs]
+            return samples_needed
+        else:
+            raise ValueError(f"Requested {num_samples} samples but only {self.n_points} points available in file {self.filepath}")
+        
+
+
+

@@ -1,0 +1,16 @@
+# image to dist
+image:
+  filepath: 'TUBAF_Logo_Cropped.png'
+  num_noise_samples: 1
+  noise: 0.001
+
+training: 
+  epochs: 20000
+  learning_rate: 1e-3
+  batch_size: 2000
+  plot_losses: True
+
+output:
+  num_samples: 20000
+  num_marginals: 5
+
