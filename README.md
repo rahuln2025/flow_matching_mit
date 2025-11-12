@@ -5,4 +5,4 @@
 ## Modified Lab 2 for Flowmatching with custom images
 Results look like this: 
 
-![Learned marginals for TUBAF Logo]([learned_marginals.png])
+![Learned marginals for TUBAF Logo](learned_marginals.png)
